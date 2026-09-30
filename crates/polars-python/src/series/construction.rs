@@ -7,6 +7,7 @@ use polars_arrow::array::{Array, PrimitiveArray};
 use polars_arrow::bitmap::BitmapBuilder;
 use polars_arrow::types::NativeType;
 use polars_buffer::{Buffer, SharedStorage};
+use polars_core::chunked_array::builder::get_list_builder;
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 
@@ -350,7 +351,19 @@ impl PySeries {
                 ));
             }
         }
-        Ok(Series::new(name.into(), series).into())
+        let dtype = series
+            .iter()
+            .flatten()
+            .next()
+            .map_or(DataType::Null, |s| s.dtype().clone());
+        let values_cap = series.iter().flatten().map(|s| s.len()).sum();
+        let mut builder = get_list_builder(&dtype, values_cap, series.len(), name.into());
+        for s in &series {
+            builder
+                .append_opt_series(s.as_ref())
+                .map_err(PyPolarsErr::from)?;
+        }
+        Ok(builder.finish().into_series().into())
     }
 
     #[staticmethod]

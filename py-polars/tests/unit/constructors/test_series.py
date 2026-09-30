@@ -214,3 +214,10 @@ def test_invalid() -> None:
         # `type: ignore`, you may have inadvertently introduced
         # an `Any` type in the `Series.__init__` signature.
         pl.Series(1)  # type: ignore[arg-type]
+
+
+def test_series_of_series_with_mismatched_dtypes_23163() -> None:
+    with pytest.raises(pl.exceptions.SchemaError, match="different dtypes"):
+        pl.Series([pl.Series([1]), pl.Series(["two"])])
+    with pytest.raises(pl.exceptions.SchemaError, match="different dtypes"):
+        pl.DataFrame([[pl.Series([1]), pl.Series(["two"])]])
