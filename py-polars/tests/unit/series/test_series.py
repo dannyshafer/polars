@@ -104,6 +104,16 @@ def test_cum_agg_with_nulls() -> None:
     assert_series_equal(s.cum_prod(), pl.Series("a", [None, 2, None, 14, 112, None]))
 
 
+def test_cum_sum_float32_precision_27662() -> None:
+    # Float32 cum_sum should accumulate at higher precision, consistent with sum()
+    n = 5_000_000
+    s = pl.select(pl.repeat(0.0005, n=n, dtype=pl.Float32)).to_series()
+    expected = n * 0.0005
+    assert s.cum_sum().dtype == pl.Float32
+    assert s.cum_sum()[-1] == pytest.approx(expected, rel=1e-6)
+    assert s.cum_sum(reverse=True)[0] == pytest.approx(expected, rel=1e-6)
+
+
 def test_cum_agg_with_infs() -> None:
     # confirm that inf values are handled correctly
     s = pl.Series([float("inf"), 0.0, 1.0])
