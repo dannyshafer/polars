@@ -1126,47 +1126,80 @@ pub async fn csv_file_info(
             Some(_) => file_size * ASSUMED_COMPRESSION_RATIO,
         };
 
+        // A file without content rows (e.g. header only) did not observe any values, so its
+        // dtypes carry no information.
+        let has_rows = first_row_len > 0;
+
         // TODO. We can do (much) better by collect statistics as part of row count and/or schema
         // inference, including observed average row_length and compression ratio.
-        let estimated_rows =
-            (decompressed_file_size_hint as f64 / first_row_len as f64).round() as usize;
+        let estimated_rows = if has_rows {
+            (decompressed_file_size_hint as f64 / first_row_len as f64).round() as usize
+        } else {
+            0
+        };
 
-        Ok((schema, estimated_rows))
+        Ok((schema, estimated_rows, has_rows))
     };
 
-    let merge_func =
-        |a: PolarsResult<(Schema, usize)>, b: PolarsResult<(Schema, usize)>| match (a, b) {
-            (Err(e), _) | (_, Err(e)) => Err(e),
-            (Ok((mut schema_a, row_estimate_a)), Ok((schema_b, row_estimate_b))) => {
-                match (schema_a.is_empty(), schema_b.is_empty()) {
-                    (true, _) => Ok((schema_b, row_estimate_b)),
-                    (_, true) => Ok((schema_a, row_estimate_a)),
-                    _ => match missing_columns_policy {
-                        MissingColumnsPolicy::Raise => {
-                            schema_a.to_supertype(&schema_b)?;
-                            Ok((schema_a, row_estimate_a.saturating_add(row_estimate_b)))
-                        },
-                        MissingColumnsPolicy::Insert => {
-                            // Union merge: keep all columns from both schemas,
-                            // supertype columns that exist in both.
-                            use polars_core::utils::try_get_supertype;
-                            for (name, dtype) in schema_b.iter() {
-                                match schema_a.get(name) {
-                                    Some(existing_dtype) => {
-                                        let st = try_get_supertype(existing_dtype, dtype)?;
-                                        schema_a.with_column(name.clone(), st);
-                                    },
-                                    None => {
-                                        schema_a.with_column(name.clone(), dtype.clone());
-                                    },
-                                }
-                            }
-                            Ok((schema_a, row_estimate_a.saturating_add(row_estimate_b)))
-                        },
+    // Inferred dtypes of a file without content rows should not influence the merged schema, so
+    // they are replaced by `Null`, which is a subtype of all other dtypes.
+    let null_dtypes = |schema: &mut Schema| {
+        for (_, dtype) in schema.iter_mut() {
+            *dtype = DataType::Null;
+        }
+    };
+
+    let merge_func = |a: PolarsResult<(Schema, usize, bool)>,
+                      b: PolarsResult<(Schema, usize, bool)>| match (a, b) {
+        (Err(e), _) | (_, Err(e)) => Err(e),
+        (
+            Ok((mut schema_a, row_estimate_a, has_rows_a)),
+            Ok((mut schema_b, row_estimate_b, has_rows_b)),
+        ) => {
+            if has_rows_a && !has_rows_b {
+                null_dtypes(&mut schema_b);
+            } else if has_rows_b && !has_rows_a {
+                null_dtypes(&mut schema_a);
+            }
+            let has_rows = has_rows_a || has_rows_b;
+
+            match (schema_a.is_empty(), schema_b.is_empty()) {
+                (true, _) => Ok((schema_b, row_estimate_b, has_rows_b)),
+                (_, true) => Ok((schema_a, row_estimate_a, has_rows_a)),
+                _ => match missing_columns_policy {
+                    MissingColumnsPolicy::Raise => {
+                        schema_a.to_supertype(&schema_b)?;
+                        Ok((
+                            schema_a,
+                            row_estimate_a.saturating_add(row_estimate_b),
+                            has_rows,
+                        ))
                     },
-                }
-            },
-        };
+                    MissingColumnsPolicy::Insert => {
+                        // Union merge: keep all columns from both schemas,
+                        // supertype columns that exist in both.
+                        use polars_core::utils::try_get_supertype;
+                        for (name, dtype) in schema_b.iter() {
+                            match schema_a.get(name) {
+                                Some(existing_dtype) => {
+                                    let st = try_get_supertype(existing_dtype, dtype)?;
+                                    schema_a.with_column(name.clone(), st);
+                                },
+                                None => {
+                                    schema_a.with_column(name.clone(), dtype.clone());
+                                },
+                            }
+                        }
+                        Ok((
+                            schema_a,
+                            row_estimate_a.saturating_add(row_estimate_b),
+                            has_rows,
+                        ))
+                    },
+                },
+            }
+        },
+    };
 
     assert!(
         csv_options.schema.is_none(),
@@ -1184,7 +1217,14 @@ pub async fn csv_file_info(
         },
     );
 
-    let (inferred_schema, estimated_n_rows) = merge_func(si_results.0, si_results.1)?;
+    let (mut inferred_schema, estimated_n_rows, _) = merge_func(si_results.0, si_results.1)?;
+    // Columns that only appear in files without content rows default to `String`, as they would
+    // have when inferred from a single file.
+    for (_, dtype) in inferred_schema.iter_mut() {
+        if dtype.is_null() {
+            *dtype = DataType::String;
+        }
+    }
     let inferred_schema_ref = Arc::new(inferred_schema);
 
     let (schema, reader_schema) = if let Some(rc) = row_index {

@@ -793,3 +793,24 @@ A,B
 def test_scan_csv_extra_columns_truncate_ragged_lines() -> None:
     with pytest.raises(ValueError):
         pl.scan_csv(b"", extra_columns="ignore", truncate_ragged_lines=False)
+
+
+@pytest.mark.parametrize("lazy", [True, False])
+def test_scan_csv_multiple_files_header_only_file_22820(lazy: bool) -> None:
+    def read(*a: Any, **kw: Any) -> pl.DataFrame:
+        return pl.scan_csv(*a, **kw).collect() if lazy else pl.read_csv(*a, **kw)
+
+    data = b"a,b\n1,x\n2,y\n"
+    header_only = b"a,b\n"
+    expect_df = pl.DataFrame({"a": [1, 2], "b": ["x", "y"]})
+
+    # A file without rows should not turn the inferred dtypes into strings.
+    assert_frame_equal(read([data, header_only]), expect_df)
+    assert_frame_equal(read([header_only, data]), expect_df)
+    assert_frame_equal(read([header_only, data, header_only]), expect_df)
+
+    # Only files without rows: dtypes default to strings, as for a single file.
+    assert_frame_equal(
+        read([header_only, header_only]),
+        pl.DataFrame(schema={"a": pl.String, "b": pl.String}),
+    )
